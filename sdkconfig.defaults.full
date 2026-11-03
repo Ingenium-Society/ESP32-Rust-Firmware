@@ -1,0 +1,18 @@
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+CONFIG_ESP_CONSOLE_SECONDARY_NONE=y
+
+# Board: ESP32-S3 N16R8 (16 MB flash, 8 MB octal PSRAM)
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_SPEED_80M=y
+# Large heap allocations (the KV cache, activations) go to PSRAM
+CONFIG_SPIRAM_USE_MALLOC=y
+CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=16384
+
+# Custom partition table: room for the app plus a 2 MB model partition
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="/Users/haidaralifawwaz/Desktop/INS/Projects/esp-rs-sf/partitions.csv"
+
+# Main task stack: inference should not run with the small default
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=16384
