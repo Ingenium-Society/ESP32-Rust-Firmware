@@ -1,0 +1,11 @@
+{
+  "params": 5350272,
+  "val_loss_fp32": 1.7122533023357391,
+  "val_loss_fp16_autocast": 1.7122320801019668,
+  "val_loss_int8_embedding": 1.7124150961637497,
+  "ternary_zero_fraction": 0.37438902562978316,
+  "bin_bytes": 1773288,
+  "ref_vs_pytorch_max_abs_diff": 0.2608604431152344,
+  "ref_vs_pytorch_mean_abs_diff": 0.026118727400898933,
+  "ref_vs_pytorch_argmax_agreement": 1.0
+}
