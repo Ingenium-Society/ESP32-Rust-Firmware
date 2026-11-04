@@ -2,6 +2,7 @@
 //! all reachable from `run`.
 
 use esp_idf_svc::sys;
+use std::sync::Mutex;
 
 use crate::engine;
 use crate::flash::{self, rd_f32, rd_u32};
@@ -9,6 +10,31 @@ use crate::generate;
 use crate::runner;
 use crate::selfcheck;
 use crate::tokenizer;
+
+/// Sampling seed for `gen`. `None` means "draw a fresh one from the hardware RNG
+/// every run"; `Some` is used verbatim, so a run can be repeated token for token.
+/// (A Mutex rather than an AtomicU64: Xtensa has no 64-bit atomics.)
+static FIXED_SEED: Mutex<Option<u64>> = Mutex::new(None);
+
+fn next_seed() -> u64 {
+    match *FIXED_SEED.lock().unwrap() {
+        Some(s) => s,
+        None => unsafe { ((sys::esp_random() as u64) << 32) | sys::esp_random() as u64 },
+    }
+}
+
+fn print_seed() {
+    match *FIXED_SEED.lock().unwrap() {
+        Some(s) => println!("seed: {} (fixed)", s),
+        None => println!("seed: random (fresh every run)"),
+    }
+}
+
+fn set_seed(seed: Option<u64>) {
+    // Bind the guard to a statement so it is released before print_seed locks again.
+    *FIXED_SEED.lock().unwrap() = seed;
+    print_seed();
+}
 
 fn gen_cmd(prompt: &str) -> Result<(), String> {
     let (m, _) = engine::Model::parse(flash::model()?)?;
@@ -18,14 +44,27 @@ fn gen_cmd(prompt: &str) -> Result<(), String> {
         return Err("tokenizer and model vocab sizes differ".into());
     }
     let mut r = runner::Runner::new(m);
-    let seed = unsafe { ((sys::esp_random() as u64) << 32) | sys::esp_random() as u64 };
-    generate::generate(&mut r, &tok, prompt, 200, seed, ctx)
+    generate::generate(&mut r, &tok, prompt, 200, next_seed(), ctx)
 }
 
 pub fn run(command: &str) {
     if command == "gen" || command.starts_with("gen ") {
         if let Err(e) = gen_cmd(command[3..].trim()) {
             println!("gen error: {}", e);
+        }
+        return;
+    }
+    // `seed <n>` / `seed random`. Kept out of the match below because the
+    // argument is free-form.
+    if let Some(arg) = command.strip_prefix("seed ") {
+        let arg = arg.trim();
+        if arg == "random" {
+            set_seed(None);
+        } else {
+            match arg.parse::<u64>() {
+                Ok(s) => set_seed(Some(s)),
+                Err(_) => println!("seed error: expected 'seed <n>' or 'seed random'"),
+            }
         }
         return;
     }
@@ -40,9 +79,11 @@ pub fn run(command: &str) {
             println!("  mem   - Show heap memory usage");
             println!("  test  - Run test vectors and report accuracy");
             println!("  gen   - Generate a story: gen <prompt>");
+            println!("  seed  - Show or fix the sampling seed: seed <n> | seed random");
             println!("  exit  - Informational exit");
         }
         "ping" => println!("connected"),
+        "seed" => print_seed(),
         "model" => match flash::model() {
             Ok(m) if &m[0..4] == b"BTLM" => println!(
                 "BTLM v{} | vocab {} | ctx {} | layers {} | heads {} | dim {} | hidden {} | theta {} | eps {:e}",

@@ -173,14 +173,15 @@ pub fn generate(
     let gen_ms = t1.elapsed().as_millis().max(1);
     println!();
     println!(
-        "[prompt {} tokens in {} ms | generated {} tokens in {} ms = {:.1} tok/s | context {}/{}]",
+        "[prompt {} tokens in {} ms | generated {} tokens in {} ms = {:.1} tok/s | context {}/{} | seed {}]",
         ids.len() - produced,
         prompt_ms,
         produced,
         gen_ms,
         produced as f32 * 1000.0 / gen_ms as f32,
         ids.len(),
-        ctx
+        ctx,
+        seed
     );
     Ok(())
 }
