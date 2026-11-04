@@ -5,7 +5,9 @@ use std::sync::OnceLock;
 use std::thread::sleep;
 use std::time::Duration;
 mod engine;
+mod generate;
 mod runner;
+mod tokenizer;
 const MAX_LINE: usize = 128;
 
 fn prompt(stdout: &mut io::Stdout) {
@@ -13,6 +15,7 @@ fn prompt(stdout: &mut io::Stdout) {
     let _ = stdout.flush();
 }
 static MODEL: OnceLock<&'static [u8]> = OnceLock::new();
+static TOKENIZER_BIN: &[u8] = include_bytes!("../models/tokenizer.bin");
 
 fn rd_u32(b: &[u8], o: usize) -> u32 {
     u32::from_le_bytes(b[o..o + 4].try_into().unwrap())
@@ -21,6 +24,17 @@ fn rd_f32(b: &[u8], o: usize) -> f32 {
     f32::from_le_bytes(b[o..o + 4].try_into().unwrap())
 }
 
+fn gen_cmd(prompt: &str) -> Result<(), String> {
+    let (m, _) = engine::Model::parse(model()?)?;
+    let ctx = m.cfg.ctx;
+    let tok = tokenizer::Tokenizer::parse(TOKENIZER_BIN)?;
+    if tok.vocab() != m.cfg.vocab {
+        return Err("tokenizer and model vocab sizes differ".into());
+    }
+    let mut r = runner::Runner::new(m);
+    let seed = unsafe { ((sys::esp_random() as u64) << 32) | sys::esp_random() as u64 };
+    generate::generate(&mut r, &tok, prompt, 200, seed, ctx)
+}
 /// Memory-map the "model" flash partition (zero-copy, read-only). Mapped once, cached.
 fn model() -> Result<&'static [u8], String> {
     if let Some(m) = MODEL.get() {
@@ -110,6 +124,12 @@ fn run_test() -> Result<(), String> {
     Ok(())
 }
 fn run_command(command: &str) {
+    if command == "gen" || command.starts_with("gen ") {
+        if let Err(e) = gen_cmd(command[3..].trim()) {
+            println!("gen error: {}", e);
+        }
+        return;
+    }
     match command {
         "help" => {
             println!("Available commands:");
@@ -120,6 +140,7 @@ fn run_command(command: &str) {
             println!("  load  - Parse model and dump fields");
             println!("  mem   - Show heap memory usage");
             println!("  test  - Run test vectors and report accuracy");
+            println!("  gen   - Generate a story: gen <prompt>");
             println!("  exit  - Informational exit");
         }
         "ping" => println!("connected"),
