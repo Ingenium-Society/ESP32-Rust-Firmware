@@ -236,13 +236,12 @@ fn main() {
                         }
                     }
                     // Printable ASCII: store and echo.
-                    0x20..=0x7e => {
-                        if line.len() < MAX_LINE {
+                    0x20..=0x7e
+                        if line.len() < MAX_LINE => {
                             line.push(c as char);
                             print!("{}", c as char);
                             let _ = stdout.flush();
                         }
-                    }
                     _ => {}
                 }
             }
