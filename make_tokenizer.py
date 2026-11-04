@@ -1,5 +1,8 @@
 """Convert a HuggingFace byte-level BPE tokenizer.json into the compact tokenizer.bin
-that the ESP32 firmware embeds.   usage: make_tokenizer.py tokenizer.json tokenizer.bin
+that the ESP32 firmware embeds.
+
+Reads  : models/tokenizer.json
+Writes : models/tokenizer.bin
 
 Layout (little endian):
   "BTOK", u32 vocab, u32 n_merges, u32 eos_id
@@ -8,8 +11,12 @@ Layout (little endian):
   n_merges x        u16 a, u16 b, u16 merged   (merge rank = position in this list)
 """
 import json
+import os
 import struct
-import sys
+
+SRC = "models/tokenizer.json"
+DST = "models/tokenizer.bin"
+
 
 def bytes_to_unicode():            # GPT-2's byte <--> printable character table
     bs = list(range(33, 127)) + list(range(161, 173)) + list(range(174, 256))
@@ -19,6 +26,7 @@ def bytes_to_unicode():            # GPT-2's byte <--> printable character table
             bs.append(b); cs.append(256 + n); n += 1
     return dict(zip(bs, map(chr, cs)))
 
+
 def merge_pair(merge):             # tokenizers <0.20 uses "a b", newer uses ["a", "b"]
     if isinstance(merge, str):
         a, b = merge.split(" ")
@@ -26,11 +34,11 @@ def merge_pair(merge):             # tokenizers <0.20 uses "a b", newer uses ["a
         a, b = merge
     return a, b
 
-if len(sys.argv) != 3:
-    sys.exit(f"usage: {sys.argv[0]} tokenizer.json tokenizer.bin")
 
-src, dst = sys.argv[1], sys.argv[2]
-t = json.load(open(src))
+if not os.path.isfile(SRC):
+    raise SystemExit(f"input not found: {SRC}")
+
+t = json.load(open(SRC))
 pre = t.get("pre_tokenizer") or {}
 assert t["model"]["type"] == "BPE" and pre.get("type") == "ByteLevel", \
     "expected a ByteLevel BPE tokenizer"
@@ -64,5 +72,7 @@ for raw in by_id:
     out += bytes([len(raw)]) + raw
 for a, b in pairs:
     out += struct.pack("<3H", vocab[a], vocab[b], vocab[a + b])
-open(dst, "wb").write(out)
-print(f"wrote {dst}: {len(out):,} bytes | vocab {V} | merges {len(pairs)} | eos id {eos}")
+
+os.makedirs(os.path.dirname(DST) or ".", exist_ok=True)
+open(DST, "wb").write(out)
+print(f"wrote {DST}: {len(out):,} bytes | vocab {V} | merges {len(pairs)} | eos id {eos}")
