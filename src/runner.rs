@@ -1,9 +1,14 @@
 //! Forward pass, one token at a time, with a KV cache.
 //! Mirrors `RefModel` from the export notebook: ternary weights, int8 activations,
 //! i32 accumulation, one rescale at the end of every matrix multiply.
+//!
+//! The heavy loops (matrix multiplies, attention heads, output layer) are split in two
+//! halves that run at the same time, one on each core. Every output value is still computed
+//! by exactly the same arithmetic as before, so results are bit-for-bit identical.
 #![allow(clippy::needless_range_loop)]
 
 use crate::engine::{Model, Tern};
+use std::sync::{mpsc, Mutex, OnceLock};
 
 pub struct Runner<'a> {
     m: Model<'a>,
@@ -23,7 +28,7 @@ pub struct Runner<'a> {
     u: Vec<f32>,  // MLP up (hidden)
     a: Vec<f32>,  // silu(g) * u (hidden)
     an: Vec<f32>, // normed a (hidden)
-    sc: Vec<f32>, // attention scores for one head (ctx)
+    sc: Vec<f32>, // attention scores, one ctx-sized buffer per core (2 * ctx)
     xq: Vec<i8>,  // quantized activations (max(dim, hidden))
     logits: Vec<f32>,
 }
@@ -60,12 +65,68 @@ fn quantize(x: &[f32], xq: &mut [i8]) -> f32 {
     s
 }
 
-/// out = (W_ternary * xq) * (gamma / s)
+type Job = Box<dyn FnOnce() + Send + 'static>;
+
+/// One long-lived worker thread pinned to core 1. Starting a new thread for every matrix
+/// multiply ran the chip out of memory, so jobs are handed to this single thread instead.
+struct Worker {
+    jobs: Mutex<mpsc::Sender<Job>>,
+    done: Mutex<mpsc::Receiver<()>>,
+}
+
+fn worker() -> &'static Worker {
+    static WORKER: OnceLock<Worker> = OnceLock::new();
+    WORKER.get_or_init(|| {
+        // The next thread we start runs on core 1 (the main task lives on core 0).
+        #[cfg(target_os = "espidf")]
+        {
+            use esp_idf_svc::hal::cpu::Core;
+            use esp_idf_svc::hal::task::thread::ThreadSpawnConfiguration;
+            let _ = ThreadSpawnConfiguration {
+                stack_size: 8192,
+                priority: 5,
+                pin_to_core: Some(Core::Core1),
+                ..Default::default()
+            }
+            .set();
+        }
+        let (job_tx, job_rx) = mpsc::channel::<Job>();
+        let (done_tx, done_rx) = mpsc::channel::<()>();
+        std::thread::spawn(move || {
+            for job in job_rx {
+                job();
+                if done_tx.send(()).is_err() {
+                    break;
+                }
+            }
+        });
+        Worker {
+            jobs: Mutex::new(job_tx),
+            done: Mutex::new(done_rx),
+        }
+    })
+}
+
+/// Run `a` on this core and `b` on the other core at the same time, then wait for both.
+fn par2<A: FnOnce() + Send, B: FnOnce() + Send>(a: A, b: B) {
+    let w = worker();
+    let job: Box<dyn FnOnce() + Send + '_> = Box::new(b);
+    // SAFETY: we do not return before the worker has reported that `b` finished, so
+    // everything `b` borrows is still alive for as long as the worker uses it.
+    // (This firmware builds with panic=abort, so `a` cannot unwind past the wait.)
+    let job = unsafe { std::mem::transmute::<Box<dyn FnOnce() + Send + '_>, Job>(job) };
+    w.jobs.lock().unwrap().send(job).unwrap();
+    a();
+    w.done.lock().unwrap().recv().unwrap();
+}
+
+/// out[k] = (row (row0 + k) of W_ternary * xq) * (gamma / s)
 /// Weights are 2 bits each, 4 per byte, lowest bits first, stored as w + 1 (0 -> -1, 1 -> 0, 2 -> +1).
-fn matvec(w: &Tern, xq: &[i8], s: f32, out: &mut [f32]) {
+fn matvec_rows(w: &Tern, xq: &[i8], s: f32, row0: usize, out: &mut [f32]) {
     let scale = w.gamma / s;
     let bytes_per_row = w.cols / 4;
-    for r in 0..w.rows {
+    for (k, o) in out.iter_mut().enumerate() {
+        let r = row0 + k;
         let row = &w.packed[r * bytes_per_row..(r + 1) * bytes_per_row];
         let mut acc: i32 = 0;
         for (j, &b) in row.iter().enumerate() {
@@ -75,7 +136,72 @@ fn matvec(w: &Tern, xq: &[i8], s: f32, out: &mut [f32]) {
                 + (((b >> 4) & 3) as i32 - 1) * x[2] as i32
                 + ((b >> 6) as i32 - 1) * x[3] as i32;
         }
-        out[r] = acc as f32 * scale;
+        *o = acc as f32 * scale;
+    }
+}
+
+/// Attention for heads h0..h1 at position `pos`. `y` and `sc` belong to this call only.
+#[allow(clippy::too_many_arguments)]
+fn attn_heads(
+    q: &[f32],
+    kc: &[f32],
+    vc: &[f32],
+    li: usize,
+    ctx: usize,
+    d: usize,
+    hd: usize,
+    pos: usize,
+    h0: usize,
+    h1: usize,
+    y: &mut [f32],
+    sc: &mut [f32],
+) {
+    let inv_sqrt = 1.0 / (hd as f32).sqrt();
+    for hh in h0..h1 {
+        let o = hh * hd;
+        let yo = (hh - h0) * hd;
+        let mut mx = f32::NEG_INFINITY;
+        for t in 0..=pos {
+            let kb = (li * ctx + t) * d + o;
+            let mut dot = 0.0f32;
+            for i in 0..hd {
+                dot += q[o + i] * kc[kb + i];
+            }
+            let score = dot * inv_sqrt;
+            sc[t] = score;
+            if score > mx {
+                mx = score;
+            }
+        }
+        let mut sum = 0.0f32;
+        for t in 0..=pos {
+            let e = (sc[t] - mx).exp();
+            sc[t] = e;
+            sum += e;
+        }
+        for i in 0..hd {
+            y[yo + i] = 0.0;
+        }
+        for t in 0..=pos {
+            let p = sc[t] / sum;
+            let vb = (li * ctx + t) * d + o;
+            for i in 0..hd {
+                y[yo + i] += p * vc[vb + i];
+            }
+        }
+    }
+}
+
+/// Tied output layer for vocabulary entries v0 .. v0 + out.len().
+fn logit_rows(emb: &[i8], emb_scale: &[f32], h: &[f32], d: usize, v0: usize, out: &mut [f32]) {
+    for (k, o) in out.iter_mut().enumerate() {
+        let v = v0 + k;
+        let erow = &emb[v * d..(v + 1) * d];
+        let mut acc = 0.0f32;
+        for i in 0..d {
+            acc += erow[i] as f32 * h[i];
+        }
+        *o = acc * emb_scale[v];
     }
 }
 
@@ -116,7 +242,7 @@ impl<'a> Runner<'a> {
             u: vec![0.0; hid],
             a: vec![0.0; hid],
             an: vec![0.0; hid],
-            sc: vec![0.0; ctx],
+            sc: vec![0.0; 2 * ctx],
             xq: vec![0; d.max(hid)],
             logits: vec![0.0; vocab],
             m,
@@ -132,6 +258,7 @@ impl<'a> Runner<'a> {
         let hd = self.hd;
         let half = hd / 2;
         let eps = c.norm_eps;
+        let (dh, hh2, nh2) = (d / 2, hid / 2, nh / 2);
         assert!(pos < ctx, "position beyond context");
         assert!(tok < c.vocab, "token id out of range");
 
@@ -142,15 +269,28 @@ impl<'a> Runner<'a> {
             self.x[i] = row[i] as f32 * es;
         }
 
-        let inv_sqrt = 1.0 / (hd as f32).sqrt();
-
         for (li, l) in m.layers.iter().enumerate() {
             // ---- attention ----
             rmsnorm(&self.x, l.attn_norm, eps, &mut self.h);
             let s = quantize(&self.h, &mut self.xq[..d]);
-            matvec(&l.wq, &self.xq[..d], s, &mut self.q);
-            matvec(&l.wk, &self.xq[..d], s, &mut self.k);
-            matvec(&l.wv, &self.xq[..d], s, &mut self.v);
+            {
+                let xq = &self.xq[..d];
+                let (qa, qb) = self.q.split_at_mut(dh);
+                let (ka, kb) = self.k.split_at_mut(dh);
+                let (va, vb) = self.v.split_at_mut(dh);
+                par2(
+                    || {
+                        matvec_rows(&l.wq, xq, s, 0, qa);
+                        matvec_rows(&l.wk, xq, s, 0, ka);
+                        matvec_rows(&l.wv, xq, s, 0, va);
+                    },
+                    || {
+                        matvec_rows(&l.wq, xq, s, dh, qb);
+                        matvec_rows(&l.wk, xq, s, dh, kb);
+                        matvec_rows(&l.wv, xq, s, dh, vb);
+                    },
+                );
+            }
 
             // RoPE on q and k, per head, first half paired with second half.
             for hh in 0..nh {
@@ -172,43 +312,28 @@ impl<'a> Runner<'a> {
             self.kc[base..base + d].copy_from_slice(&self.k);
             self.vc[base..base + d].copy_from_slice(&self.v);
 
-            // Causal attention over positions 0..=pos, head by head.
-            for hh in 0..nh {
-                let o = hh * hd;
-                let mut mx = f32::NEG_INFINITY;
-                for t in 0..=pos {
-                    let kb = (li * ctx + t) * d + o;
-                    let mut dot = 0.0f32;
-                    for i in 0..hd {
-                        dot += self.q[o + i] * self.kc[kb + i];
-                    }
-                    let score = dot * inv_sqrt;
-                    self.sc[t] = score;
-                    if score > mx {
-                        mx = score;
-                    }
-                }
-                let mut sum = 0.0f32;
-                for t in 0..=pos {
-                    let e = (self.sc[t] - mx).exp();
-                    self.sc[t] = e;
-                    sum += e;
-                }
-                for i in 0..hd {
-                    self.y[o + i] = 0.0;
-                }
-                for t in 0..=pos {
-                    let p = self.sc[t] / sum;
-                    let vb = (li * ctx + t) * d + o;
-                    for i in 0..hd {
-                        self.y[o + i] += p * self.vc[vb + i];
-                    }
-                }
+            // Causal attention over positions 0..=pos: first half of the heads on this core,
+            // second half on the other one.
+            {
+                let (sc0, sc1) = self.sc.split_at_mut(ctx);
+                let (ya, yb) = self.y.split_at_mut(nh2 * hd);
+                let (q, kc, vc) = (&self.q[..], &self.kc[..], &self.vc[..]);
+                par2(
+                    || attn_heads(q, kc, vc, li, ctx, d, hd, pos, 0, nh2, ya, sc0),
+                    || attn_heads(q, kc, vc, li, ctx, d, hd, pos, nh2, nh, yb, sc1),
+                );
             }
 
             rmsnorm(&self.y, l.wo_norm, eps, &mut self.h);
             let s = quantize(&self.h, &mut self.xq[..d]);
-            matvec(&l.wo, &self.xq[..d], s, &mut self.t);
+            {
+                let xq = &self.xq[..d];
+                let (ta, tb) = self.t.split_at_mut(dh);
+                par2(
+                    || matvec_rows(&l.wo, xq, s, 0, ta),
+                    || matvec_rows(&l.wo, xq, s, dh, tb),
+                );
+            }
             for i in 0..d {
                 self.x[i] += self.t[i];
             }
@@ -216,15 +341,35 @@ impl<'a> Runner<'a> {
             // ---- MLP (SwiGLU) ----
             rmsnorm(&self.x, l.mlp_norm, eps, &mut self.h);
             let s = quantize(&self.h, &mut self.xq[..d]);
-            matvec(&l.w_gate, &self.xq[..d], s, &mut self.g);
-            matvec(&l.w_up, &self.xq[..d], s, &mut self.u);
+            {
+                let xq = &self.xq[..d];
+                let (ga, gb) = self.g.split_at_mut(hh2);
+                let (ua, ub) = self.u.split_at_mut(hh2);
+                par2(
+                    || {
+                        matvec_rows(&l.w_gate, xq, s, 0, ga);
+                        matvec_rows(&l.w_up, xq, s, 0, ua);
+                    },
+                    || {
+                        matvec_rows(&l.w_gate, xq, s, hh2, gb);
+                        matvec_rows(&l.w_up, xq, s, hh2, ub);
+                    },
+                );
+            }
             for i in 0..hid {
                 let g = self.g[i];
                 self.a[i] = (g / (1.0 + (-g).exp())) * self.u[i];
             }
             rmsnorm(&self.a, l.down_norm, eps, &mut self.an);
             let s = quantize(&self.an, &mut self.xq[..hid]);
-            matvec(&l.w_down, &self.xq[..hid], s, &mut self.t);
+            {
+                let xq = &self.xq[..hid];
+                let (ta, tb) = self.t.split_at_mut(dh);
+                par2(
+                    || matvec_rows(&l.w_down, xq, s, 0, ta),
+                    || matvec_rows(&l.w_down, xq, s, dh, tb),
+                );
+            }
             for i in 0..d {
                 self.x[i] += self.t[i];
             }
@@ -232,13 +377,14 @@ impl<'a> Runner<'a> {
 
         // Final norm, then the tied output layer (embedding table used as the output matrix).
         rmsnorm(&self.x, m.final_norm, eps, &mut self.h);
-        for v in 0..c.vocab {
-            let erow = &m.emb[v * d..(v + 1) * d];
-            let mut acc = 0.0f32;
-            for i in 0..d {
-                acc += erow[i] as f32 * self.h[i];
-            }
-            self.logits[v] = acc * m.emb_scale[v];
+        {
+            let vh = c.vocab / 2;
+            let (emb, esc, hv) = (m.emb, m.emb_scale, &self.h[..]);
+            let (la, lb) = self.logits.split_at_mut(vh);
+            par2(
+                || logit_rows(emb, esc, hv, d, 0, la),
+                || logit_rows(emb, esc, hv, d, vh, lb),
+            );
         }
         &self.logits
     }
