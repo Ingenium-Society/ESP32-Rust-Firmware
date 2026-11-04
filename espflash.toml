@@ -1,0 +1,4 @@
+[flash]
+mode = "qio"
+size = "16MB"
+frequency = "80MHz"

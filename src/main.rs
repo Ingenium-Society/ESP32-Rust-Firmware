@@ -64,7 +64,11 @@ fn model() -> Result<&'static [u8], String> {
         if err != 0 {
             return Err(format!("esp_partition_mmap failed: {}", err));
         }
-        std::slice::from_raw_parts(ptr as *const u8, size)
+        // Copy the model into PSRAM (u32 buffer keeps it 4-byte aligned). Done once, ~2 MB.
+        let mut copy = vec![0u32; size / 4];
+        std::ptr::copy_nonoverlapping(ptr as *const u8, copy.as_mut_ptr() as *mut u8, size);
+        let leaked: &'static mut [u32] = Box::leak(copy.into_boxed_slice());
+        std::slice::from_raw_parts(leaked.as_ptr() as *const u8, size)
     };
     let _ = MODEL.set(m);
     Ok(m)

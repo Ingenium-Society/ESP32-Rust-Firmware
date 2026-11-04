@@ -111,7 +111,7 @@ fn flush_utf8(buf: &mut Vec<u8>, force: bool) {
 
 /// Let FreeRTOS run the idle task, otherwise the task watchdog complains during long runs.
 fn yield_cpu() {
-    std::thread::sleep(std::time::Duration::from_millis(1));
+    std::thread::sleep(std::time::Duration::from_millis(10));
 }
 
 /// Continue `prompt` and stream the text to the console. An empty prompt starts a fresh story.
