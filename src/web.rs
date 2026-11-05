@@ -156,40 +156,45 @@ pub fn start() -> Result<(), String> {
                     .write_all(b"Empty prompt.");
             }
 
-            let rx = match job::submit_generate(prompt, MAX_NEW_TOKENS, random_seed()) {
-                Ok(rx) => rx,
-                Err(e) => {
-                    return req
-                        .into_response(
-                            503,
-                            Some("Busy"),
-                            &[("Content-Type", "text/plain; charset=utf-8")],
-                        )?
-                        .write_all(e.as_bytes());
-                }
-            };
-
-            // No Content-Length: every write goes out as a chunk, so the browser
-            // shows text as the chip produces it.
-            let mut resp = req.into_response(
-                200,
-                Some("OK"),
-                &[("Content-Type", "text/plain; charset=utf-8")],
-            )?;
-
-            for msg in rx {
-                match msg {
-                    job::Msg::Text(bytes) => resp.write_all(&bytes)?,
-                    job::Msg::Failed(e) => {
-                        resp.write_all(format!("\n[error: {}]", e).as_bytes())?;
-                        break;
-                    }
-                    job::Msg::Generated(_) => {}
-                }
+            // Returns at once. The story is not sent down this connection -- every
+            // client reads it from /state, so they all see the same thing and no
+            // socket is tied up for 30 seconds.
+            match job::submit_generate(prompt, MAX_NEW_TOKENS, random_seed()) {
+                Ok(_rx) => req
+                    .into_response(202, Some("Accepted"), &[("Content-Type", "text/plain")])?
+                    .write_all(b"queued"),
+                Err(e) => req
+                    .into_response(
+                        503,
+                        Some("Busy"),
+                        &[("Content-Type", "text/plain; charset=utf-8")],
+                    )?
+                    .write_all(e.as_bytes()),
             }
-            Ok(())
         })
         .map_err(|e| format!("route /gen: {}", e))?;
+
+    server
+        .fn_handler("/state", Method::Get, |req| {
+            let (id, prompt, text, generating) = job::snapshot();
+            let body = format!(
+                "{{\"id\":{},\"generating\":{},\"prompt\":\"{}\",\"text\":\"{}\"}}",
+                id,
+                generating,
+                json_escape(&prompt),
+                json_escape(&text)
+            );
+            req.into_response(
+                200,
+                Some("OK"),
+                &[
+                    ("Content-Type", "application/json"),
+                    ("Cache-Control", "no-store"),
+                ],
+            )?
+            .write_all(body.as_bytes())
+        })
+        .map_err(|e| format!("route /state: {}", e))?;
 
     // Everything else is a captive-portal probe (captive.apple.com,
     // connectivitycheck.gstatic.com, ...). Bounce it to the page: that is what
@@ -212,12 +217,29 @@ pub fn start() -> Result<(), String> {
     println!("ssid: {} (open, no password)", SSID);
     println!("page: {home}");
     println!(
-        "story runs to EOS or the context limit, {} prompt slots, captive portal on",
+        "one shared story, {} prompt slot, captive portal on",
         job::QUEUE_DEPTH
     );
 
     *slot = Some(wifi);
     Ok(())
+}
+
+/// Minimal JSON string escaping. Generated prose is full of quotes.
+fn json_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 8);
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push(' '),
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 /// Answer every DNS query with the AP's address.

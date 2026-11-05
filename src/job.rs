@@ -3,6 +3,10 @@
 //! The serial REPL and the HTTP handler both submit jobs here. There can only
 //! ever be one `Runner` alive: two of them plus the 2 MB model copy would be
 //! 8 MB of PSRAM, which is all of it.
+//!
+//! It also owns `VIEW`: the one story every connected phone is looking at. The
+//! task appends to it as tokens arrive, and the HTTP handlers read snapshots.
+//! That is what makes the page a shared screen rather than a private chat.
 
 use crate::engine;
 use crate::flash;
@@ -11,10 +15,51 @@ use crate::runner::Runner;
 use crate::selfcheck;
 use crate::tokenizer::Tokenizer;
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TrySendError};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
-/// How many prompts may wait behind the one being generated.
-pub const QUEUE_DEPTH: usize = 3;
+/// How many prompts may wait behind the one being generated. One: a second
+/// visitor can line up a story while the current one plays, a third is told no.
+pub const QUEUE_DEPTH: usize = 1;
+
+/// The story everyone is watching.
+pub struct View {
+    pub id: u64,
+    pub prompt: String,
+    pub text: String,
+    pub generating: bool,
+}
+
+static VIEW: Mutex<View> = Mutex::new(View {
+    id: 0,
+    prompt: String::new(),
+    text: String::new(),
+    generating: false,
+});
+
+fn view_begin(prompt: &str) {
+    let mut v = VIEW.lock().unwrap();
+    v.id += 1;
+    v.prompt.clear();
+    v.prompt.push_str(prompt);
+    v.text.clear();
+    v.generating = true;
+}
+
+fn view_push(bytes: &[u8]) {
+    if let Ok(s) = std::str::from_utf8(bytes) {
+        VIEW.lock().unwrap().text.push_str(s);
+    }
+}
+
+fn view_finish() {
+    VIEW.lock().unwrap().generating = false;
+}
+
+/// `(id, prompt, text, generating)` for the HTTP handlers.
+pub fn snapshot() -> (u64, String, String, bool) {
+    let v = VIEW.lock().unwrap();
+    (v.id, v.prompt.clone(), v.text.clone(), v.generating)
+}
 
 /// Progress reports sent back to whoever submitted the job.
 pub enum Msg {
@@ -112,9 +157,12 @@ fn serve(rx: Receiver<Task>) {
                 seed,
                 out,
             } => {
+                view_begin(&prompt);
                 let res = generate::run(&mut r, &tok, &prompt, max_new, seed, ctx, |bytes| {
+                    view_push(bytes);
                     let _ = out.send(Msg::Text(bytes.to_vec()));
                 });
+                view_finish();
                 let _ = match res {
                     Ok(stats) => out.send(Msg::Generated(stats)),
                     Err(e) => out.send(Msg::Failed(e)),
