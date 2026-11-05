@@ -24,8 +24,10 @@ use crate::job;
 
 const SSID: &str = "Mini-Trits";
 
-/// One story at a booth. 64 tokens is ~14 s at 4.6 tok/s; 200 would be 40 s.
-const MAX_NEW_TOKENS: usize = 64;
+/// No output cap: the story runs until the model emits EOS or the context fills.
+/// The context (256 tokens) is the only bound -- roughly 25 s typical, 55 s worst
+/// case at 4.6 tok/s.
+const MAX_NEW_TOKENS: usize = usize::MAX;
 
 /// Longest prompt we accept, in bytes.
 const MAX_PROMPT: usize = 200;
@@ -210,8 +212,7 @@ pub fn start() -> Result<(), String> {
     println!("ssid: {} (open, no password)", SSID);
     println!("page: {home}");
     println!(
-        "{} tokens per story, {} prompt slots, captive portal on",
-        MAX_NEW_TOKENS,
+        "story runs to EOS or the context limit, {} prompt slots, captive portal on",
         job::QUEUE_DEPTH
     );
 

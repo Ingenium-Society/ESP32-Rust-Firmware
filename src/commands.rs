@@ -10,9 +10,8 @@ use crate::flash::{self, rd_f32, rd_u32};
 use crate::job;
 use crate::web;
 
-/// Longest story the serial console will produce. The web page caps at 64 for a
-/// booth; from the console we can afford to let it run longer.
-const REPL_MAX_NEW_TOKENS: usize = 200;
+/// No output cap: the story runs until the model emits EOS or the context fills.
+const REPL_MAX_NEW_TOKENS: usize = usize::MAX;
 
 /// Sampling seed for `gen`. `None` means "draw a fresh one from the hardware RNG
 /// every run"; `Some` is used verbatim, so a run can be repeated token for token.
