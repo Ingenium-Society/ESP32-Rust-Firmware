@@ -1,7 +1,7 @@
 //! SoftAP + the visitor-facing page.
 //!
 //! `wifi` brings up an open access point and an HTTP server. Visitors join
-//! `Mini-Tritty`, open http://192.168.4.1, type a prompt and watch the story
+//! `Mini-Trits`, open http://192.168.4.1, type a prompt and watch the story
 //! stream in as the chip produces it.
 //!
 //! The AP is one-shot: reset the board to get back to a wired-only build. There
@@ -25,7 +25,7 @@ use std::sync::Mutex;
 
 use crate::job;
 
-const SSID: &str = "Mini-Tritty";
+const SSID: &str = "Mini-Trits";
 
 /// One story at a booth. 64 tokens is ~14 s at 4.6 tok/s; 200 would be 40 s.
 const MAX_NEW_TOKENS: usize = 64;

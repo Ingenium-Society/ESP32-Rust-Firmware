@@ -1,4 +1,4 @@
-//! Mini-Tritty firmware: boots, prints a banner, starts the generation task and
+//! Mini-Trits firmware: boots, prints a banner, starts the generation task and
 //! hands the console to the REPL. Everything else lives in the modules below.
 //!
 //! engine     BTLM file parser (borrowed view over flash/PSRAM)
