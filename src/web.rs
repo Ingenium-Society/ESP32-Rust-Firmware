@@ -1,15 +1,15 @@
-//! WiFi smoke test.
+//! SoftAP + the visitor-facing page.
 //!
-//! Brings up a SoftAP and serves one page, to answer three questions before we
-//! build anything bigger:
+//! `wifi` brings up an open access point and an HTTP server. Visitors join
+//! `Mini-Tritty`, open http://192.168.4.1, type a prompt and watch the story
+//! stream in as the chip produces it.
 //!
-//!   1. does the radio come up at all with octal PSRAM at 80 MHz?
-//!   2. how much internal RAM does it cost?
-//!   3. does `gen` still work while the AP is running, and at what speed?
+//! The AP is one-shot: reset the board to get back to a wired-only build. There
+//! is no `wifi off` on purpose -- tearing down a live httpd + netif pair is a
+//! failure mode we do not need at a booth.
 //!
-//! The AP is one-shot: bring it up with `wifi`, and reset the board to get back
-//! to a wired-only build. There is no `wifi off` on purpose -- tearing down a
-//! live httpd + netif pair is a failure mode we do not need during a smoke test.
+//! All the arithmetic happens in the generation task (see `job`); these handlers
+//! only move bytes.
 
 use esp_idf_svc::eventloop::EspSystemEventLoop;
 use esp_idf_svc::hal::peripherals::Peripherals;
@@ -23,7 +23,17 @@ use esp_idf_svc::wifi::{
 };
 use std::sync::Mutex;
 
+use crate::job;
+
 const SSID: &str = "Mini-Tritty";
+
+/// One story at a booth. 64 tokens is ~14 s at 4.6 tok/s; 200 would be 40 s.
+const MAX_NEW_TOKENS: usize = 64;
+
+/// Longest prompt we accept, in bytes.
+const MAX_PROMPT: usize = 200;
+
+const PAGE: &str = include_str!("page.html");
 
 type Ap = BlockingWifi<EspWifi<'static>>;
 
@@ -41,6 +51,10 @@ fn heap_free() -> (usize, usize) {
 fn print_heap(label: &str) {
     let (i, p) = heap_free();
     println!("  {:<7} internal {} B | psram {} B", label, i, p);
+}
+
+fn random_seed() -> u64 {
+    unsafe { ((sys::esp_random() as u64) << 32) | sys::esp_random() as u64 }
 }
 
 pub fn start() -> Result<(), String> {
@@ -80,31 +94,86 @@ pub fn start() -> Result<(), String> {
         .get_ip_info()
         .map_err(|e| format!("ip: {}", e))?;
 
-    print_heap("after");
+    let mut server = EspHttpServer::new(&HttpConfig {
+        max_open_sockets: 4,
+        max_uri_handlers: 4,
+        stack_size: 8192,
+        ..Default::default()
+    })
+    .map_err(|e| format!("httpd: {}", e))?;
 
-    let mut server =
-        EspHttpServer::new(&HttpConfig::default()).map_err(|e| format!("httpd: {}", e))?;
     server
         .fn_handler("/", Method::Get, |req| {
-            let (i, p) = heap_free();
-            let body = format!(
-                "<!doctype html><meta name=viewport content=\"width=device-width,initial-scale=1\">\
-                 <body style=\"font:16px system-ui;padding:2rem;line-height:1.6\">\
-                 <h1>Mini-Tritty is up</h1>\
-                 <p>This page is served by the ESP32-S3 itself, over its own access point.</p>\
-                 <p>internal {i} B free &middot; psram {p} B free</p>\
-                 </body>"
-            );
-            req.into_ok_response()?.write_all(body.as_bytes())
+            req.into_response(
+                200,
+                Some("OK"),
+                &[("Content-Type", "text/html; charset=utf-8")],
+            )?
+            .write_all(PAGE.as_bytes())
         })
-        .map_err(|e| format!("route: {}", e))?;
+        .map_err(|e| format!("route /: {}", e))?;
+
+    server
+        .fn_handler("/gen", Method::Post, |mut req| {
+            let mut buf = [0u8; MAX_PROMPT];
+            let mut len = 0;
+            while len < buf.len() {
+                match req.read(&mut buf[len..]) {
+                    Ok(0) => break,
+                    Ok(n) => len += n,
+                    Err(_) => break,
+                }
+            }
+            let prompt = String::from_utf8_lossy(&buf[..len]).trim().to_string();
+
+            if prompt.is_empty() {
+                return req
+                    .into_response(400, Some("Bad Request"), &[("Content-Type", "text/plain")])?
+                    .write_all(b"Empty prompt.");
+            }
+
+            let rx = match job::submit_generate(prompt, MAX_NEW_TOKENS, random_seed()) {
+                Ok(rx) => rx,
+                Err(e) => {
+                    return req
+                        .into_response(
+                            503,
+                            Some("Busy"),
+                            &[("Content-Type", "text/plain; charset=utf-8")],
+                        )?
+                        .write_all(e.as_bytes());
+                }
+            };
+
+            // No Content-Length: every write goes out as a chunk, so the browser
+            // shows text as the chip produces it.
+            let mut resp = req.into_response(
+                200,
+                Some("OK"),
+                &[("Content-Type", "text/plain; charset=utf-8")],
+            )?;
+
+            for msg in rx {
+                match msg {
+                    job::Msg::Text(bytes) => resp.write_all(&bytes)?,
+                    job::Msg::Failed(e) => {
+                        resp.write_all(format!("\n[error: {}]", e).as_bytes())?;
+                        break;
+                    }
+                    job::Msg::Generated(_) => {}
+                }
+            }
+            Ok(())
+        })
+        .map_err(|e| format!("route /gen: {}", e))?;
 
     // The server stops when dropped, so it has to outlive this call.
     std::mem::forget(server);
 
+    print_heap("after");
     println!("ssid: {} (open, no password)", SSID);
-    println!("open: http://{}", ip.ip);
-    println!("now run `gen Lily is` and compare ms/token against the wired run.");
+    println!("page: http://{}", ip.ip);
+    println!("{} tokens per story, {} prompt slots", MAX_NEW_TOKENS, job::QUEUE_DEPTH);
 
     *slot = Some(wifi);
     Ok(())

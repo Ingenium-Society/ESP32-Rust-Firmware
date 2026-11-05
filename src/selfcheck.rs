@@ -1,20 +1,20 @@
 //! Compares the integer engine against PyTorch's logits, using the reference
 //! vectors baked into the firmware. This is what `test` runs.
+//!
+//! Takes a borrowed `Runner` rather than building its own: the generation task
+//! owns the only one, because two 3 MB KV caches would not fit in PSRAM.
 
-use crate::engine;
 use crate::flash::{self, rd_f32, rd_u32};
-use crate::runner;
+use crate::runner::Runner;
 
-pub fn run() -> Result<(), String> {
-    let (m, _) = engine::Model::parse(flash::model()?)?;
+pub fn run(r: &mut Runner, vocab: usize) -> Result<(), String> {
     let tv = flash::TEST_VECTORS;
     let n = rd_u32(tv, 0) as usize;
     let v = rd_u32(tv, 4) as usize;
-    if v != m.cfg.vocab || tv.len() != 8 + 4 * n + 4 * n * v {
+    if v != vocab || tv.len() != 8 + 4 * n + 4 * n * v {
         return Err("test_vectors.bin has an unexpected size".into());
     }
 
-    let mut r = runner::Runner::new(m);
     let (mut max_d, mut sum_d, mut agree) = (0f32, 0f64, 0usize);
     let t0 = std::time::Instant::now();
     for i in 0..n {

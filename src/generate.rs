@@ -1,14 +1,27 @@
-//! Sampling and the generation loop. Same sampler as the export notebook's `sample_next`:
-//! repetition penalty over the last 64 tokens, temperature, top-k, then a random draw.
+//! Sampling and the generation loop. Same sampler as the export notebook's
+//! `sample_next`: repetition penalty over the last 64 tokens, temperature, top-k,
+//! then a random draw.
+//!
+//! `run` writes the generated text through a sink rather than straight to stdout,
+//! so the serial REPL and the HTTP handler can share it.
 
 use crate::runner::Runner;
 use crate::tokenizer::Tokenizer;
-use std::io::Write;
 
 const TEMPERATURE: f32 = 0.7;
 const TOP_K: usize = 40;
 const REP_PENALTY: f32 = 1.15;
 const REP_WINDOW: usize = 64;
+
+/// What one run cost, reported back to whoever submitted the job.
+pub struct Stats {
+    pub prompt_tokens: usize,
+    pub generated: usize,
+    pub prompt_ms: u128,
+    pub gen_ms: u128,
+    pub ctx: usize,
+    pub seed: u64,
+}
 
 /// xorshift64* : tiny and good enough for sampling.
 pub struct Rng(u64);
@@ -77,27 +90,32 @@ fn sample(logits: &[f32], history: &[usize], rng: &mut Rng) -> usize {
     cand.last().map(|c| c.0).unwrap_or(0)
 }
 
-/// Print whatever part of `buf` is complete UTF-8; keep an unfinished character for later.
-fn flush_utf8(buf: &mut Vec<u8>, force: bool) {
+/// Emit whatever part of `buf` is complete UTF-8; keep an unfinished character for
+/// later. Replacement characters are emitted for invalid sequences.
+fn flush_utf8<F: FnMut(&[u8])>(buf: &mut Vec<u8>, force: bool, sink: &mut F) {
     loop {
         match std::str::from_utf8(buf) {
             Ok(s) => {
-                print!("{}", s);
+                if !s.is_empty() {
+                    sink(s.as_bytes());
+                }
                 buf.clear();
                 break;
             }
             Err(e) => {
                 let v = e.valid_up_to();
-                print!("{}", std::str::from_utf8(&buf[..v]).unwrap_or(""));
+                if v > 0 {
+                    sink(&buf[..v]);
+                }
                 match e.error_len() {
                     Some(bad) => {
-                        print!("\u{FFFD}");
+                        sink("\u{FFFD}".as_bytes());
                         buf.drain(..v + bad);
                     }
                     None => {
                         buf.drain(..v);
                         if force {
-                            print!("\u{FFFD}");
+                            sink("\u{FFFD}".as_bytes());
                             buf.clear();
                         }
                         break;
@@ -106,23 +124,24 @@ fn flush_utf8(buf: &mut Vec<u8>, force: bool) {
             }
         }
     }
-    let _ = std::io::stdout().flush();
 }
 
-/// Let FreeRTOS run the idle task, otherwise the task watchdog complains during long runs.
+/// Let FreeRTOS run other tasks -- the httpd and the WiFi stack when they are up.
 fn yield_cpu() {
     std::thread::sleep(std::time::Duration::from_millis(10));
 }
 
-/// Continue `prompt` and stream the text to the console. An empty prompt starts a fresh story.
-pub fn generate(
+/// Continue `prompt`, pushing the generated text through `sink` as it is produced.
+/// An empty prompt starts a fresh story.
+pub fn run<F: FnMut(&[u8])>(
     r: &mut Runner,
     tok: &Tokenizer,
     prompt: &str,
     max_new: usize,
     seed: u64,
     ctx: usize,
-) -> Result<(), String> {
+    mut sink: F,
+) -> Result<Stats, String> {
     let mut ids = tok.encode(prompt);
     if ids.is_empty() {
         ids.push(tok.eos());
@@ -148,8 +167,8 @@ pub fn generate(
         yield_cpu();
     }
     let prompt_ms = t0.elapsed().as_millis();
+    let prompt_tokens = ids.len();
 
-    print!("{}", prompt);
     let mut pending: Vec<u8> = Vec::new();
     let mut produced = 0usize;
     let t1 = std::time::Instant::now();
@@ -160,7 +179,7 @@ pub fn generate(
             break;
         }
         pending.extend_from_slice(tok.token_bytes(nxt));
-        flush_utf8(&mut pending, false);
+        flush_utf8(&mut pending, false, &mut sink);
 
         last.clear();
         last.extend_from_slice(r.step(nxt, ids.len()));
@@ -168,20 +187,14 @@ pub fn generate(
         produced += 1;
         yield_cpu();
     }
-    flush_utf8(&mut pending, true);
+    flush_utf8(&mut pending, true, &mut sink);
 
-    let gen_ms = t1.elapsed().as_millis().max(1);
-    println!();
-    println!(
-        "[prompt {} tokens in {} ms | generated {} tokens in {} ms = {:.1} tok/s | context {}/{} | seed {}]",
-        ids.len() - produced,
+    Ok(Stats {
+        prompt_tokens,
+        generated: produced,
         prompt_ms,
-        produced,
-        gen_ms,
-        produced as f32 * 1000.0 / gen_ms as f32,
-        ids.len(),
+        gen_ms: t1.elapsed().as_millis().max(1),
         ctx,
-        seed
-    );
-    Ok(())
+        seed,
+    })
 }

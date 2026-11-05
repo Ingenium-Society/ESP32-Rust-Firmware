@@ -2,15 +2,17 @@
 //! all reachable from `run`.
 
 use esp_idf_svc::sys;
+use std::io::Write;
 use std::sync::Mutex;
 
 use crate::engine;
 use crate::flash::{self, rd_f32, rd_u32};
-use crate::generate;
-use crate::runner;
-use crate::selfcheck;
-use crate::tokenizer;
+use crate::job;
 use crate::web;
+
+/// Longest story the serial console will produce. The web page caps at 64 for a
+/// booth; from the console we can afford to let it run longer.
+const REPL_MAX_NEW_TOKENS: usize = 200;
 
 /// Sampling seed for `gen`. `None` means "draw a fresh one from the hardware RNG
 /// every run"; `Some` is used verbatim, so a run can be repeated token for token.
@@ -38,14 +40,33 @@ fn set_seed(seed: Option<u64>) {
 }
 
 fn gen_cmd(prompt: &str) -> Result<(), String> {
-    let (m, _) = engine::Model::parse(flash::model()?)?;
-    let ctx = m.cfg.ctx;
-    let tok = tokenizer::Tokenizer::parse(flash::TOKENIZER_BIN)?;
-    if tok.vocab() != m.cfg.vocab {
-        return Err("tokenizer and model vocab sizes differ".into());
+    let rx = job::submit_generate(prompt.to_string(), REPL_MAX_NEW_TOKENS, next_seed())?;
+    print!("{}", prompt);
+    let _ = std::io::stdout().flush();
+    for msg in rx {
+        match msg {
+            job::Msg::Text(bytes) => {
+                print!("{}", String::from_utf8_lossy(&bytes));
+                let _ = std::io::stdout().flush();
+            }
+            job::Msg::Generated(st) => {
+                println!();
+                println!(
+                    "[prompt {} tokens in {} ms | generated {} tokens in {} ms = {:.1} tok/s | context {}/{} | seed {}]",
+                    st.prompt_tokens,
+                    st.prompt_ms,
+                    st.generated,
+                    st.gen_ms,
+                    st.generated as f32 * 1000.0 / st.gen_ms as f32,
+                    st.prompt_tokens + st.generated,
+                    st.ctx,
+                    st.seed
+                );
+            }
+            job::Msg::Failed(e) => println!("\ngen error: {}", e),
+        }
     }
-    let mut r = runner::Runner::new(m);
-    generate::generate(&mut r, &tok, prompt, 200, next_seed(), ctx)
+    Ok(())
 }
 
 pub fn run(command: &str) {
@@ -120,8 +141,9 @@ pub fn run(command: &str) {
             println!("internal free: {} bytes", sys::heap_caps_get_free_size(sys::MALLOC_CAP_INTERNAL));
             println!("psram free:    {} bytes", sys::heap_caps_get_free_size(sys::MALLOC_CAP_SPIRAM));
         },
-        "test" => match selfcheck::run() {
-            Ok(()) => {}
+        "test" => match job::submit_selfcheck() {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => println!("test error: {}", e),
             Err(e) => println!("test error: {}", e),
         },
         "" => {}

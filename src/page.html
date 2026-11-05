@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Mini-Tritty</title>
+<style>
+  :root{--ink:#1b2547;--gold:#c0a860;--cream:#f5f0e4;--muted:#6b6a63}
+  *{box-sizing:border-box}
+  body{margin:0;padding:20px 18px 40px;background:var(--cream);color:var(--ink);
+       font:16px/1.55 ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif}
+  main{max-width:640px;margin:0 auto}
+  h1{font-size:28px;letter-spacing:-.02em;margin:0 0 2px}
+  .sub{color:var(--muted);font-size:14px;margin:0 0 20px}
+  .chips{display:flex;flex-wrap:wrap;gap:8px;margin:0 0 14px}
+  .chip{font:13px/1 inherit;padding:8px 11px;border:1px solid #d8d2c0;border-radius:99px;
+        background:#fffdf7;color:var(--ink);cursor:pointer}
+  .chip:active{background:#efe9d8}
+  textarea{width:100%;padding:12px;border:1px solid #d8d2c0;border-radius:8px;background:#fffdf7;
+           color:var(--ink);font:16px/1.5 inherit;resize:vertical;min-height:64px}
+  button{width:100%;margin-top:10px;padding:13px;border:0;border-radius:8px;background:var(--gold);
+         color:#fff;font:600 16px/1 inherit;cursor:pointer}
+  button:disabled{opacity:.5}
+  #out{margin-top:18px;padding:14px;min-height:90px;border:1px dashed #d8d2c0;border-radius:8px;
+       white-space:pre-wrap;word-wrap:break-word;font-size:15px}
+  #out.empty{color:var(--muted);font-style:italic}
+  #status{margin-top:10px;font-size:13px;color:var(--muted);font-variant-numeric:tabular-nums}
+  footer{margin-top:26px;font-size:12px;color:var(--muted)}
+</style>
+<main>
+  <h1>Mini-Tritty</h1>
+  <p class="sub">A 5&nbsp;MB language model running on the ESP32-S3 in front of you.
+     No internet, no server &mdash; this page came from the chip.</p>
+
+  <div class="chips" id="chips"></div>
+
+  <textarea id="p" maxlength="120" placeholder="Start a story&hellip;"></textarea>
+  <button id="go">Tell me a story</button>
+
+  <div id="out" class="empty">Your story will appear here.</div>
+  <div id="status"></div>
+
+  <footer>About 15&nbsp;seconds per story. One visitor at a time &mdash; please let the
+    person beside you have a turn.</footer>
+</main>
+<script>
+const EXAMPLES = ["Lily is", "Once upon a time, a little robot",
+                  "One day, a boy named Tom found a", "The dog was very sad because"];
+const p = document.getElementById('p'), out = document.getElementById('out'),
+      go = document.getElementById('go'), status = document.getElementById('status');
+
+document.getElementById('chips').innerHTML =
+  EXAMPLES.map(e => `<button class="chip" data-p="${e.replace(/"/g, '&quot;')}">${e}</button>`).join('');
+document.getElementById('chips').onclick = ev => {
+  const t = ev.target.closest('.chip');
+  if (t) { p.value = t.dataset.p; p.focus(); }
+};
+
+go.onclick = async () => {
+  const prompt = p.value.trim();
+  if (!prompt) { p.focus(); return; }
+  go.disabled = true;
+  out.className = '';
+  out.textContent = '';
+  status.textContent = 'warming up the chip\u2026';
+  const t0 = performance.now();
+  let n = 0;
+  try {
+    const res = await fetch('/gen', { method: 'POST', body: prompt });
+    if (!res.ok) {
+      out.textContent = await res.text();
+      status.textContent = '';
+      return;
+    }
+    const reader = res.body.getReader();
+    const dec = new TextDecoder();
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      out.textContent += dec.decode(value, { stream: true });
+      n += 1;
+      status.textContent = `${n} chunks \u00b7 ${((performance.now() - t0) / 1000).toFixed(1)} s`;
+    }
+    const s = (performance.now() - t0) / 1000;
+    status.textContent = `done in ${s.toFixed(1)} s \u00b7 ~${(64 / s).toFixed(1)} tokens/s`;
+  } catch (e) {
+    out.textContent = out.textContent || 'Connection lost. Move closer to the board and try again.';
+    status.textContent = '';
+  } finally {
+    go.disabled = false;
+  }
+};
+</script>
+</html>
