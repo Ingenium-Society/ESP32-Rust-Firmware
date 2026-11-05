@@ -26,9 +26,11 @@ pub fn run() {
     prompt(&mut stdout);
 
     let mut byte = [0u8; 1];
+    let mut errors = 0usize;
     loop {
         match stdin.read(&mut byte) {
             Ok(1) => {
+                errors = 0;
                 let c = byte[0];
                 let was_cr = last_was_cr;
                 last_was_cr = c == b'\r';
@@ -63,10 +65,14 @@ pub fn run() {
             Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::Interrupted) => {
                 sleep(Duration::from_millis(10));
             }
-            // A real error: report it without flooding the console.
+            // A real error. Running standalone off a charger there is no USB host,
+            // so this repeats forever: report it once, then back right off.
             Err(e) => {
-                println!("Input error: {}", e);
-                sleep(Duration::from_millis(500));
+                errors += 1;
+                if errors == 1 {
+                    println!("Input error: {} (no console host? running headless)", e);
+                }
+                sleep(Duration::from_millis(if errors < 5 { 500 } else { 5000 }));
             }
         }
     }

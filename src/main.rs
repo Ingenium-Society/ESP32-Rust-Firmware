@@ -41,5 +41,12 @@ fn main() {
     // first prompt is not the slow one.
     job::start();
 
+    // Standalone booth mode: bring the AP up at boot, so the board serves the page
+    // with nothing attached but a USB charger. A failure here is not fatal -- the
+    // serial console still works.
+    if let Err(e) = web::start() {
+        println!("web: {}", e);
+    }
+
     console::run();
 }

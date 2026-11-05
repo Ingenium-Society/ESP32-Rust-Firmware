@@ -102,14 +102,11 @@ pub fn run(command: &str) {
             println!("  test  - Run test vectors and report accuracy");
             println!("  gen   - Generate a story: gen <prompt>");
             println!("  seed  - Show or fix the sampling seed: seed <n> | seed random");
-            println!("  wifi  - Start the SoftAP and serve a test page");
+            println!("  wifi  - Show access point status");
             println!("  exit  - Informational exit");
         }
         "ping" => println!("connected"),
-        "wifi" => match web::start() {
-            Ok(()) => {}
-            Err(e) => println!("wifi error: {}", e),
-        },
+        "wifi" => web::ensure(),
         "seed" => print_seed(),
         "model" => match flash::model() {
             Ok(m) if &m[0..4] == b"BTLM" => println!(
