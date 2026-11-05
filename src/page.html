@@ -42,7 +42,8 @@
   </div>
   <div id="status"></div>
 
-  <p class="shared">Everyone connected is watching this same story, live.</p>
+  <p class="shared">Everyone connected is watching this same story, live. You can queue
+    your own prompt while one is playing.</p>
 </main>
 <script>
 const p = document.getElementById('p'), go = document.getElementById('go'),
@@ -63,10 +64,17 @@ function render(st) {
     out.classList.toggle('empty', !t);
     out.scrollTop = out.scrollHeight;
   }
-  go.disabled = st.generating || !p.value.trim();
-  status.textContent = st.generating
-    ? 'writing\u2026'
-    : (t ? 'done \u2014 ask the next one' : 'waiting for someone to start a story');
+
+  // You can always queue, unless the line is full. Watching is not waiting.
+  go.disabled = st.full || !p.value.trim();
+
+  const waiting = st.queued > 0
+    ? ' \u00b7 ' + st.queued + ' waiting' + (st.queued === 1 ? '' : '')
+    : '';
+  if (st.full && !st.generating) status.textContent = 'queue full \u2014 ask again in a moment';
+  else if (st.generating) status.textContent = 'writing\u2026' + waiting;
+  else if (t) status.textContent = 'done \u2014 ask the next one' + waiting;
+  else status.textContent = 'waiting for someone to start a story' + waiting;
 }
 
 async function tick() {
@@ -87,7 +95,10 @@ go.onclick = async () => {
   try {
     const res = await fetch('/gen', { method: 'POST', body: prompt });
     if (!res.ok) status.textContent = await res.text();
-    else p.value = '';
+    else {
+      p.value = '';
+      status.textContent = 'queued \u2014 watch the story above';
+    }
   } catch (e) {
     status.textContent = 'could not reach the board';
   }
@@ -97,7 +108,6 @@ go.onclick = async () => {
 p.addEventListener('keydown', e => {
   if (e.key === 'Enter') { e.preventDefault(); go.click(); }
 });
-p.addEventListener('input', () => { go.disabled = false; });
 
 setInterval(tick, 300);
 tick();

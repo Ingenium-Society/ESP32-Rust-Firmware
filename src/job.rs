@@ -17,9 +17,9 @@ use crate::tokenizer::Tokenizer;
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TrySendError};
 use std::sync::{Mutex, OnceLock};
 
-/// How many prompts may wait behind the one being generated. One: a second
-/// visitor can line up a story while the current one plays, a third is told no.
-pub const QUEUE_DEPTH: usize = 1;
+/// How many prompts may wait behind the one being generated. A visitor joining
+/// mid-story can line up one or two more; beyond that they are told busy.
+pub const QUEUE_DEPTH: usize = 2;
 
 /// The story everyone is watching.
 pub struct View {
@@ -27,6 +27,8 @@ pub struct View {
     pub prompt: String,
     pub text: String,
     pub generating: bool,
+    /// Prompts submitted but not started yet.
+    pub queued: usize,
 }
 
 static VIEW: Mutex<View> = Mutex::new(View {
@@ -34,6 +36,7 @@ static VIEW: Mutex<View> = Mutex::new(View {
     prompt: String::new(),
     text: String::new(),
     generating: false,
+    queued: 0,
 });
 
 fn view_begin(prompt: &str) {
@@ -43,6 +46,7 @@ fn view_begin(prompt: &str) {
     v.prompt.push_str(prompt);
     v.text.clear();
     v.generating = true;
+    v.queued = v.queued.saturating_sub(1);
 }
 
 fn view_push(bytes: &[u8]) {
@@ -55,10 +59,36 @@ fn view_finish() {
     VIEW.lock().unwrap().generating = false;
 }
 
-/// `(id, prompt, text, generating)` for the HTTP handlers.
-pub fn snapshot() -> (u64, String, String, bool) {
+fn view_unqueue() {
+    let mut v = VIEW.lock().unwrap();
+    v.queued = v.queued.saturating_sub(1);
+}
+
+/// A copy of the view for the HTTP handlers.
+pub struct Snapshot {
+    pub id: u64,
+    pub prompt: String,
+    pub text: String,
+    pub generating: bool,
+    pub queued: usize,
+}
+
+impl Snapshot {
+    /// No room for another prompt.
+    pub fn full(&self) -> bool {
+        self.queued >= QUEUE_DEPTH
+    }
+}
+
+pub fn snapshot() -> Snapshot {
     let v = VIEW.lock().unwrap();
-    (v.id, v.prompt.clone(), v.text.clone(), v.generating)
+    Snapshot {
+        id: v.id,
+        prompt: v.prompt.clone(),
+        text: v.text.clone(),
+        generating: v.generating,
+        queued: v.queued,
+    }
 }
 
 /// Progress reports sent back to whoever submitted the job.
@@ -101,6 +131,9 @@ pub fn submit_generate(
 ) -> Result<Receiver<Msg>, String> {
     let q = QUEUE.get().ok_or("generation task is not running")?;
     let (tx, rx) = mpsc::channel();
+    // Count before sending: the task decrements as soon as it picks the job up,
+    // so the other order would let it go negative for a moment.
+    VIEW.lock().unwrap().queued += 1;
     match q.try_send(Task::Generate {
         prompt,
         max_new,
@@ -108,11 +141,14 @@ pub fn submit_generate(
         out: tx,
     }) {
         Ok(()) => Ok(rx),
-        Err(TrySendError::Full(_)) => Err(format!(
-            "busy -- {} prompts are already queued",
-            QUEUE_DEPTH
-        )),
-        Err(TrySendError::Disconnected(_)) => Err("generation task stopped".into()),
+        Err(TrySendError::Full(_)) => {
+            view_unqueue();
+            Err("busy -- the queue is full, try again in a moment".into())
+        }
+        Err(TrySendError::Disconnected(_)) => {
+            view_unqueue();
+            Err("generation task stopped".into())
+        }
     }
 }
 

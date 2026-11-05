@@ -176,13 +176,15 @@ pub fn start() -> Result<(), String> {
 
     server
         .fn_handler("/state", Method::Get, |req| {
-            let (id, prompt, text, generating) = job::snapshot();
+            let s = job::snapshot();
             let body = format!(
-                "{{\"id\":{},\"generating\":{},\"prompt\":\"{}\",\"text\":\"{}\"}}",
-                id,
-                generating,
-                json_escape(&prompt),
-                json_escape(&text)
+                "{{\"id\":{},\"generating\":{},\"queued\":{},\"full\":{},\"prompt\":\"{}\",\"text\":\"{}\"}}",
+                s.id,
+                s.generating,
+                s.queued,
+                s.full(),
+                json_escape(&s.prompt),
+                json_escape(&s.text)
             );
             req.into_response(
                 200,
