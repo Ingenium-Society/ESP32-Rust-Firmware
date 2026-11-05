@@ -20,6 +20,7 @@ mod generate;
 mod runner;
 mod selfcheck;
 mod tokenizer;
+mod web;
 
 fn main() {
     // Apply ESP-IDF patches required by esp-idf-svc.

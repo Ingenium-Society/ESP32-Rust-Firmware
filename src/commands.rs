@@ -10,6 +10,7 @@ use crate::generate;
 use crate::runner;
 use crate::selfcheck;
 use crate::tokenizer;
+use crate::web;
 
 /// Sampling seed for `gen`. `None` means "draw a fresh one from the hardware RNG
 /// every run"; `Some` is used verbatim, so a run can be repeated token for token.
@@ -80,9 +81,14 @@ pub fn run(command: &str) {
             println!("  test  - Run test vectors and report accuracy");
             println!("  gen   - Generate a story: gen <prompt>");
             println!("  seed  - Show or fix the sampling seed: seed <n> | seed random");
+            println!("  wifi  - Start the SoftAP and serve a test page");
             println!("  exit  - Informational exit");
         }
         "ping" => println!("connected"),
+        "wifi" => match web::start() {
+            Ok(()) => {}
+            Err(e) => println!("wifi error: {}", e),
+        },
         "seed" => print_seed(),
         "model" => match flash::model() {
             Ok(m) if &m[0..4] == b"BTLM" => println!(
